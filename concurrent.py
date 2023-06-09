@@ -17,13 +17,13 @@ def concurrent_async(limit: int = None):
 
 
 from concurrent.futures import ThreadPoolExecutor
-from threading import Semaphore 
+import threading
 
 
 def concurrent_thread(limit: int = None):
     def decorator(func):
         if limit:
-            semaphore = Semaphore(limit)
+            semaphore = threading.Semaphore(limit)
         thread_pool_executor = ThreadPoolExecutor(max_workers=limit)
         @functools.wraps(func)
         def wrapper(*args, **kwargs):

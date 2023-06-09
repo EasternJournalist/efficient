@@ -1,10 +1,21 @@
 import functools
 import asyncio
+import logging
 
-from .exception import MaxRetryExceeded
+
+__all__ = ['retry', 'safe']
 
 
-__all__ = ['retry']
+
+def safe(func):
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await func(*args, **kwargs)
+        except Exception as e:
+            logging.exception(e)
+            return None
+    return wrapper
 
 
 def retry(max_retry: int = 5, exception = Exception, cooldown: float = 0):
@@ -21,6 +32,6 @@ def retry(max_retry: int = 5, exception = Exception, cooldown: float = 0):
                     ex = e
                 if cooldown > 0:
                     await asyncio.sleep(cooldown)
-            raise MaxRetryExceeded(ex)
+            raise ex
         return wrapper
     return decorator

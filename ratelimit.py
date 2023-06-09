@@ -4,8 +4,8 @@ import queue
 import functools
 import inspect
 from typing import Union, List, Literal, Any
-from threading import Lock
-
+import threading
+from contextvars import ContextVar
 
 class RateLimit:
     """
@@ -23,7 +23,7 @@ class RateLimit:
             self.limit = limit
             self.interval = interval
         self.created_times = []
-        self.lock = Lock()
+        self.lock = threading.Lock()
 
     def wait_for_rate_limit(self):
         with self.lock:
@@ -80,9 +80,14 @@ class RateLimitAsync:
             self.limit = limit
             self.interval = interval
         self.created_times = []
-        self.lock = asyncio.Lock()
+
+        self.current_loop = None
+        self.lock = None
 
     async def wait_for_rate_limit(self):
+        if self.current_loop is not asyncio.get_running_loop():
+            self.current_loop = asyncio.get_running_loop()
+            self.lock = asyncio.Lock()
         async with self.lock:
             while len(self.created_times) == self.limit:
                 sleep = self.interval - (time.time() - self.created_times[0])
