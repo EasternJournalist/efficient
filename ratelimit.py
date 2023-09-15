@@ -8,7 +8,7 @@ import threading
 from typing import *
 import inspect
 
-__all__ = ["rate_limit", "rate_limit_async", "RateLimit", "RateLimitAsync", "RateLimitQueue", "RateLimitQueueAsync"]
+__all__ = ["rate_limit", "RateLimit", "RateLimitAsync", "RateLimitQueue", "RateLimitQueueAsync"]
 
 
 class RateLimit:

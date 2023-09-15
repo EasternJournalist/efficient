@@ -19,7 +19,7 @@ class WorkerOnChildProcess(ABC):
     Inherit this class to create a worker process that loops over `.work(...)` function as a coroutine asynchronously.
     The benifit is that the worker process is not created and destroyed. (This is efficient when the function refers heavy data.)
     """
-    CHECK_ALIVE_INTERVAL = 5
+    CHECK_ALIVE_INTERVAL = 3
 
     def __init__(self, verbose: bool = False, revive: bool = False):
         """
@@ -79,11 +79,12 @@ class WorkerOnChildProcess(ABC):
         while True:
             try:
                 await asyncio.wait_for(data_available.wait(), timeout=self.CHECK_ALIVE_INTERVAL)
-                break
             except asyncio.exceptions.TimeoutError:
                 pass
             if not self.child_process.is_alive():   
                 raise RuntimeError(f"Worker process died")
+            if self.read.poll():
+                break
         result = self.read.recv()
         data_available.clear()
         asyncio.get_event_loop().remove_reader(self.read.fileno())
@@ -119,7 +120,7 @@ class Scheduler:
         if self.recycle_on_exception:
             try:
                 result = await fn(resource)
-            except Exception:
+            except:
                 self.free_objects.put_nowait(resource)
                 raise
         else:
@@ -142,7 +143,7 @@ class WorkersOnChildProcesses(ABC):
 
     Use `self.RANK` to get the rank of the current worker process.
     """
-    CHECK_ALIVE_INTERVAL = 5
+    CHECK_ALIVE_INTERVAL = 3
     RANK: int = None
 
     def __init__(self, num_workers: int, verbose: bool = False, revive: bool = False):
@@ -151,6 +152,12 @@ class WorkersOnChildProcesses(ABC):
         self.revive = revive
         self.workers: List[_WorkerProcess] = None
     
+    def _restart(self, worker: _WorkerProcess):
+        worker.read, child_write = mp.Pipe(duplex=False)
+        child_read, worker.write = mp.Pipe(duplex=False)
+        worker.process = mp.Process(target=self._child_process, args=(worker.rank, child_read, child_write))
+        worker.process.start()
+
     def start(self):
         if self.workers is not None:
             if not self.revive:
@@ -159,7 +166,8 @@ class WorkersOnChildProcesses(ABC):
                 worker.process.terminate()
                 worker.process.join()
             self.workers = None
-            print("Restart worker processes")
+            if self.verbose:
+                print("Restart worker processes")
         workers = []
         for rank in range(self.num_workers):
             read, child_write = mp.Pipe(duplex=False)
@@ -168,7 +176,7 @@ class WorkersOnChildProcesses(ABC):
             child_process.start()
             workers.append(_WorkerProcess(rank, read, write, child_process))
         self.workers = workers
-        self.scheduler = Scheduler(workers)
+        self.scheduler = Scheduler(workers, recycle_on_exception=self.revive)
 
     def _child_process(self, rank: int, child_read: Connection, child_write: Connection):
         if self.verbose:
@@ -185,8 +193,9 @@ class WorkersOnChildProcesses(ABC):
         except KeyboardInterrupt:
             pass
         except Exception:
-            print(f"\033[91mError occurred in worker process \033[0m")
+            print(f"\033[91mError occurred in worker process rank {rank}\033[0m")
             traceback.print_exc()
+        exit()
 
     @abstractmethod
     def init(self):
@@ -204,31 +213,38 @@ class WorkersOnChildProcesses(ABC):
                 assert self.revive, f"Worker process is dead. Set revive=True to allow restarting child process"
                 if self.verbose:
                     print(f"Revive worker process")
-                worker.read, child_write = mp.Pipe(duplex=False)
-                child_read, worker.write = mp.Pipe(duplex=False)
-                worker.process = mp.Process(target=self._child_process, args=(worker.rank, child_read, child_write))
-
+                self._restart(worker)
             worker.write.send((args, kwds))
             data_available = asyncio.Event()
             asyncio.get_event_loop().add_reader(worker.read.fileno(), data_available.set)
             while True:
                 try:
-                    await asyncio.wait_for(data_available.wait(), timeout=self.CHECK_ALIVE_INTERVAL)
-                    break
+                    if not worker.read.poll():
+                        await asyncio.wait_for(data_available.wait(), timeout=self.CHECK_ALIVE_INTERVAL)
                 except asyncio.exceptions.TimeoutError:
                     pass
-                if not worker.process.is_alive():   
+                if not worker.process.is_alive():
+                    if self.revive:
+                        self._restart(worker)
                     raise RuntimeError(f"Worker process died")
-            result = worker.read.recv()
-            data_available.clear()
+                if worker.read.poll():
+                    break
+            try:
+                result = worker.read.recv()
+            except:
+                if worker.process.is_alive():
+                    worker.process.kill()
+                self._restart(worker)
+                raise RuntimeError(f"Worker process is corrupted. Kill it")
             asyncio.get_event_loop().remove_reader(worker.read.fileno())
             return result
         return await self.scheduler.run(_task)
 
     def terminate(self):
         for worker in self.workers:
-            worker.process.terminate()
-            worker.process.join()
+            if worker.process.is_alive():
+                worker.process.terminate()
+                worker.process.join()
 
     def kill(self):
         for worker in self.workers:
@@ -258,6 +274,9 @@ class FunctionWorkerWrapper(WorkerOnChildProcess):
     def __init__(self, fn: Callable, verbose: bool = False, revive: bool = False):
         super().__init__(verbose=verbose, revive=revive)
         self.fn = fn
+
+    def init(self):
+        pass
 
     def work(self, *args, **kwargs):
         return self.fn(*args, **kwargs)
@@ -296,9 +315,12 @@ class FunctionWorkersWrapper(WorkersOnChildProcesses):
     def __init__(self, fn: Callable, num_workers: int, verbose: bool = False, revive: bool = False):
         super().__init__(num_workers, verbose=verbose, revive=revive)
         self.fn = fn
+    
+    def init(self):
+        pass
 
     def work(self, *args, **kwargs):
-        return self.fn(*args, **kwargs)
+        return self.fn(self.RANK, *args, **kwargs)
 
     async def __call__(self, *args, **kwargs):
         return await self.run(*args, **kwargs)
