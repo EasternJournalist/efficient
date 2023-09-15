@@ -3,9 +3,11 @@ from functools import wraps, partial
 import time
 import asyncio
 from typing import * 
-
 import multiprocessing as mp
 from multiprocessing.connection import Connection
+import pickle
+
+from aiopipe import aioduplex, AioDuplex
 
 __all__ = ['AsyncWorker', 'AsyncWorkers', 'async_worker', 'async_workers']
 
@@ -16,47 +18,88 @@ class AsyncWorker:
     The benifit is that the worker process is not created and destroyed
     every time the function is called. This is useful when the function refers heavy data.
     """
-    def __init__(self, func: Callable, verbose: bool = False):
+    def __init__(self, func: Callable, verbose: bool = False, revive: bool = False):
         """
         Parameters
         ----------
         func: a picklable function
-        trace_footprints: bool: whether to trace the time footprints of the function
         """
         self.func = func
         self.verbose = verbose
-        self.parent_conn, self.child_conn = mp.Pipe(duplex=True)
-        self.process = mp.Process(target=self._process, args=(self.child_conn,))
+        self.revive = revive
+        self.init_process()
+    
+    def init_process(self):
+        self.parent_conn, self.child_conn = aioduplex()
+        with self.child_conn.detach() as child_conn:
+            self.process = mp.Process(target=self._process, args=(child_conn,))
         self.process.start()
 
-    def _process(self, conn: Connection):
-        if self.verbose:
-            print("Process for \"{}\" is created".format(str(self.func)))
-        try:
-            while True:
-                args, kwds = conn.recv()
-                if self.verbose:
-                    print("Process for \"{}\" is called".format(str(self.func)))
-                output = self.func(*args, **kwds)
-                conn.send(output)
-        except KeyboardInterrupt:
-            pass
-        except Exception as e:
-            print(f"Error occurred in worker process for \"{str(self.func)}\"")
-            traceback.print_exc()
-            print('Exception: {}'.format(e))
+    def _process(self, conn: AioDuplex):
+        async def _task():
+            print('start')
+            if self.verbose:
+                print("Process for \"{}\" is created".format(str(self.func)))
+            try:
+                while True:
+                    async with conn.open() as (reader, writer):
+                        print('fuck')
+                        args, kwds = pickle.loads(await reader.read())
+                        print('fuck then')
+                        if self.verbose:
+                            print("Process for \"{}\" is called".format(str(self.func)))
+                        output = self.func(*args, **kwds)
+                        print('send')
+                        writer.write(pickle.dumps(output))
+                    print('sended')
+            except KeyboardInterrupt:
+                pass
+            except Exception as e:
+                print(f"Error occurred in worker process for \"{str(self.func)}\"")
+                traceback.print_exc()
+                print('Exception: {}'.format(e))
+        asyncio.run(_task())
             
     async def __call__(self, *args, **kwds):
-        self.parent_conn.send((args, kwds))
-        data_available = asyncio.Event()
-        asyncio.get_event_loop().add_reader(self.parent_conn.fileno(), data_available.set)
-
-        if not self.parent_conn.poll():
-            await data_available.wait()
-
-        result = self.parent_conn.recv()
-        data_available.clear()
-        return result
+        if not self.process.is_alive():
+            assert self.revive, f"Worker process for \"{str(self.func)}\" is dead. Set revive=True to allow restart"
+            if self.verbose:
+                print(f"Revive process for \"{str(self.func)}\"")
+            self.init_process()
+        # self.parent_conn.send((args, kwds))
+        # data_available = asyncio.Event()
+        # asyncio.get_event_loop().add_reader(self.parent_conn.fileno(), data_available.set)
+        # while True:
+        #     try:
+        #         print('wait')
+        #         await asyncio.wait_for(data_available.wait(), timeout=5)
+        #         print('got')
+        #         break
+        #     except asyncio.exceptions.TimeoutError:
+        #         print('wait timeout')
+        #         pass
+        #     if not self.process.is_alive():
+        #         self.process.kill()    
+        #         raise RuntimeError(f"Worker process for \"{str(self.func)}\" is dead")
+        # print('get')
+        # result = self.parent_conn.recv()
+        # print('got')
+        async with self.parent_conn.open() as (reader, writer):
+            writer.write(pickle.dumps((args, kwds)))
+            while True:
+                try:
+                    result = await asyncio.wait_for(reader.read(), timeout=5)
+                    if not result:
+                        continue
+                    print('got', result)
+                    result = pickle.loads(result)
+                    return result
+                except asyncio.exceptions.TimeoutError:
+                    print('wait timeout')
+                    pass
+                if not self.process.is_alive():
+                    self.process.kill()    
+                    raise RuntimeError(f"Worker process for \"{str(self.func)}\" is dead")
 
     def __del__(self):
         if hasattr(self, 'process'):
@@ -65,21 +108,33 @@ class AsyncWorker:
 
 
 class AsyncWorkers:
-    def __init__(self, func: Callable, num_workers: int):
+    def __init__(self, func: Callable, num_workers: int, verbose: bool = False, revive: bool = False):
         self.func = func
         self.num_workers = num_workers
-        self.workers = [AsyncWorker(wraps(func)(partial(func, worker_id=i))) for i in range(num_workers)]
+        self.revive = revive
+        self.workers = [
+            AsyncWorker(wraps(func)(partial(func, worker_id=i)), verbose=verbose, revive=revive) 
+                for i in range(num_workers)
+        ]
         self.free_workers: asyncio.Queue = None
         self.current_loop = None
 
     async def __call__(self, *args, **kwds):
         if self.current_loop is not asyncio.get_running_loop():
             self.current_loop = asyncio.get_running_loop()
+            self.lock = asyncio.Lock()
             self.free_workers = asyncio.Queue(maxsize=self.num_workers)
             for worker in self.workers:
                 self.free_workers.put_nowait(worker)
         worker: AsyncWorker = await self.free_workers.get()
-        ret = await worker(*args, **kwds)
+        if self.revive:
+            try:
+                ret = await worker(*args, **kwds)
+            except RuntimeError:
+                self.free_workers.put_nowait(worker)
+                raise
+        else:
+            ret = await worker(*args, **kwds)
         self.free_workers.put_nowait(worker)
         return ret
 
@@ -97,7 +152,8 @@ def decorator_with_optional_args(decorator):
     return new_decorator
 
 
-def async_worker(unbounded_method: Callable):
+@decorator_with_optional_args
+def async_worker(unbounded_method: Callable, *, verbose: bool = False, revive: bool = False):
     """
     A decorator that wraps a method as a worker method running in a persistent separate process.
     The process will be created when the method is called for the first time. 
@@ -114,21 +170,21 @@ def async_worker(unbounded_method: Callable):
         def wrapper2(self, *args, **kwds):
             if not isinstance(getattr(self, fname), AsyncWorker):
                 bound_method = unbounded_method.__get__(self)
-                setattr(self, fname, AsyncWorker(bound_method))
+                setattr(self, fname, AsyncWorker(bound_method, verbose=verbose, revive=revive))
             return getattr(self, fname)(*args, **kwds)
         return wrapper2
     else:
         # For global function
-        return wraps(unbounded_method)(AsyncWorker(unbounded_method))
+        return wraps(unbounded_method)(AsyncWorker(unbounded_method, verbose=verbose, revive=revive))
     
 
 @decorator_with_optional_args
-def async_workers(unbounded_method: Callable, *, num_workers: int):
+def async_workers(unbounded_method: Callable, *, num_workers: int, verbose: bool = False, revive: bool = False):
     """
     A decorator that wraps a method as a number of workers running separate processes respectively.
     Jobs will be submitted to a free worker process. If all workers are busy, the main process will be blocked.
     The processes will be created when the method is called for the first time. 
-    The wrapped method will return an Result object, which can be used to get the result.
+    The wrapped method becomes a Coroutine.
     
     NOTE: This decorator wrap the method only in the main process. In subprocesses, this decorator does nothing but return the original method.
     """
@@ -141,9 +197,9 @@ def async_workers(unbounded_method: Callable, *, num_workers: int):
         def wrapper2(self, *args, **kwds):
             if not isinstance(getattr(self, fname), AsyncWorkers):
                 bound_method = unbounded_method.__get__(self)
-                setattr(self, fname, AsyncWorkers(bound_method, num_workers))
+                setattr(self, fname, AsyncWorkers(bound_method, num_workers=num_workers, verbose=verbose, revive=revive))
             return getattr(self, fname)(*args, **kwds)
         return wrapper2
     else:
         # For global function
-        return wraps(unbounded_method)(AsyncWorkers(unbounded_method, num_workers))
+        return wraps(unbounded_method)(AsyncWorkers(unbounded_method, num_workers=num_workers, verbose=verbose, revive=revive))
