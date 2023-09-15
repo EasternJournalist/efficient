@@ -2,6 +2,18 @@ import asyncio
 import functools
 from typing import *
 
+
+__all__ = ["async_concurrency_limit", "concurrent_async", "concurrent_thread"]
+
+
+def async_concurrency_limit(fn: Coroutine, max_concurrency: int) -> Coroutine:
+    semaphore = asyncio.Semaphore(max_concurrency)
+    async def wrapper(*args, **kwargs):
+        async with semaphore:
+            return await fn(*args, **kwargs)
+    return wrapper
+
+
 class AutoSemaphore:
     def __init__(self, value) -> None:
         self.semaphore = None

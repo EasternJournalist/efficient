@@ -2,7 +2,8 @@ from typing import *
 import asyncio
 
 
-__all__ = ["AutoBatcher"]
+__all__ = ["DynamicBatcher"]
+
 
 class Batch:
     def __init__(self, fn: Callable[[Any], Coroutine], max_batch_size: int):
@@ -44,9 +45,17 @@ class Batch:
         return self.outputs[idx]
 
 
-class AutoBatcher:
-    def __init__(self, fn: Callable[[Any], Coroutine], max_batch_size: int):
-        self.fn = fn
+class DynamicBatcher:
+    """
+    A dynamic batcher that accepts inputs one by one asynchronously and launch them as a batch when the batch is full or the patience is reached.
+    """
+    def __init__(self, batch_fn: Callable[[List[Any]], Awaitable[List[Any]]], max_batch_size: int):
+        """
+        Args:
+            batch_fn: A coroutine function that accepts a list (Batch) of inputs and returns a list of outputs.
+            max_batch_size: The maximum size of a batch.
+        """
+        self.fn = batch_fn
         self.max_batch_size = max_batch_size
         self.current_batch: Batch = Batch(self.fn, self.max_batch_size)
         self.lock = asyncio.Lock()
