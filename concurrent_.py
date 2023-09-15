@@ -1,17 +1,27 @@
 import asyncio
 import functools
 from typing import *
+import inspect
+
+__all__ = ["concurrent_limit", "concurrent_async", "concurrent_thread"]
 
 
-__all__ = ["async_concurrency_limit", "concurrent_async", "concurrent_thread"]
-
-
-def async_concurrency_limit(fn: Coroutine, max_concurrency: int) -> Coroutine:
-    semaphore = asyncio.Semaphore(max_concurrency)
-    async def wrapper(*args, **kwargs):
-        async with semaphore:
-            return await fn(*args, **kwargs)
-    return wrapper
+def concurrent_limit(max_concurrency: int) -> Coroutine:
+    def decorator(fn: Callable):
+        if inspect.iscoroutinefunction(fn):
+            semaphore = asyncio.Semaphore(max_concurrency)
+            @functools.wraps(fn)
+            async def wrapper(*args, **kwargs):
+                async with semaphore:
+                    return await fn(*args, **kwargs)
+        else:
+            semaphore = threading.Semaphore(max_concurrency)
+            @functools.wraps(fn)
+            def wrapper(*args, **kwargs):
+                with semaphore:
+                    return fn(*args, **kwargs)
+        return wrapper
+    return decorator
 
 
 class AutoSemaphore:

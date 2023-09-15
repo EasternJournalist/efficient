@@ -5,7 +5,8 @@ import functools
 import inspect
 from typing import Union, List, Literal, Any
 import threading
-
+from typing import *
+import inspect
 
 __all__ = ["rate_limit", "rate_limit_async", "RateLimit", "RateLimitAsync", "RateLimitQueue", "RateLimitQueueAsync"]
 
@@ -131,28 +132,22 @@ class RateLimitQueueAsync(asyncio.Queue):
 
 def rate_limit(rps: int = None, rpm: int = None, limit: int = None, interval: int = None):
     """
-    Decorator for rate limiting a function
+    Decorator for rate limiting a function / coroutine.
     """
-    def decorator(func):
-        r = RateLimit(rps=rps, rpm=rpm, limit=limit, interval=interval)
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            r.wait_for_rate_limit()
-            return func(*args, **kwargs)
-        return wrapper
-    return decorator
-
-
-def rate_limit_async(rps: int = None, rpm: int = None, limit: int = None, interval: int = None):
-    """
-    Decorator for rate limiting a coroutine.
-    """
-    def decorator(func):
-        r = RateLimitAsync(rps=rps, rpm=rpm, limit=limit, interval=interval)
-        @functools.wraps(func)
-        async def wrapper(*args, **kwargs):
-            await r.wait_for_rate_limit()
-            return await func(*args, **kwargs)
-        return wrapper
+    def decorator(func: Callable):
+        if inspect.iscoroutinefunction(func):
+            r = RateLimitAsync(rps=rps, rpm=rpm, limit=limit, interval=interval)
+            @functools.wraps(func)
+            async def wrapper(*args, **kwargs):
+                await r.wait_for_rate_limit()
+                return await func(*args, **kwargs)
+            return wrapper
+        else:
+            r = RateLimit(rps=rps, rpm=rpm, limit=limit, interval=interval)
+            @functools.wraps(func)
+            def wrapper(*args, **kwargs):
+                r.wait_for_rate_limit()
+                return func(*args, **kwargs)
+            return wrapper
     return decorator
 
