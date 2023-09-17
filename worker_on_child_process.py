@@ -350,4 +350,9 @@ def workers_on_child_processes(unbounded_method: Callable, *, num_workers: int, 
         return wrapper2
     else:
         # For global function
-        return wraps(unbounded_method)(FunctionWorkersWrapper(unbounded_method, num_workers, verbose=verbose, revive=revive))
+        wrapper = FunctionWorkersWrapper(unbounded_method, num_workers, verbose=verbose, revive=revive)
+        @wraps(unbounded_method)
+        def wrapper1(*args, **kwargs):
+            return wrapper(*args, **kwargs)
+        wrapper.fn = wrapper1
+        return wrapper1
