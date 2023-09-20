@@ -155,8 +155,11 @@ class WorkersOnChildProcesses(ABC):
     def _restart(self, worker: _WorkerProcess):
         worker.read, child_write = mp.Pipe(duplex=False)
         child_read, worker.write = mp.Pipe(duplex=False)
+        workers, scheduler = self.workers, self.scheduler
+        self.workers, self.scheduler = None, None
         worker.process = mp.Process(target=self._child_process, args=(worker.rank, child_read, child_write))
         worker.process.start()
+        self.workers, self.scheduler = workers, scheduler
 
     def start(self):
         if self.workers is not None:
