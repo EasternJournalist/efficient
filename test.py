@@ -1,28 +1,29 @@
-import asyncio
-from worker_on_child_process import WorkersOnChildProcesses
+from efficient import ThreadWorker, Pipeline, SequentialPipeline
+import time
 
+class Square(ThreadWorker):
+    def work(self, x):
+        time.sleep(1.0)
+        return x ** 2
 
-class XXX(WorkersOnChildProcesses):
-    def __init__(self):
-        super().__init__(num_workers=1, revive=True)
-
-    def init(self):
-        self.x = self.RANK ** 2
+class TimesTwo(ThreadWorker):
+    def work(self, x):
+        time.sleep(1.0)
+        return x ** 2
     
-    def work(self, i):
-        raise RuntimeError
-        print('work', self.RANK)
-        return self.x + i
+class AddOne(ThreadWorker):
+    def work(self, x):
+        time.sleep(1.0)
+        return x + 1
+    
+pipe = SequentialPipeline(
+    Square(),
+    TimesTwo(),
+    AddOne()
+)
 
+for i in range(10):
+    pipe.put(i)
 
-async def main():
-    xxx = XXX()
-    for i in range(10):
-        try:
-            print(await xxx.run(i))
-        except:
-            pass
-    xxx.terminate()
-
-
-asyncio.run(main())
+while not pipe.empty():
+    print(pipe.get())
