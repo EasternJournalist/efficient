@@ -12,11 +12,12 @@ import time
 import uuid
 from copy import deepcopy
 import itertools
+import functools
 
 __all__ = [
     'Node', 
     'Link',
-    'JobNode',
+    'ConcurrentNode',
     'Worker', 
     'WorkerFunction',
     'Provider',
@@ -32,7 +33,7 @@ TERMINATE_CHECK_INTERVAL = 0.5
 
 
 class _ItemWrapper:
-    def __init__(self, data: Union[Any, List[Any]], id: Union[int, List[int]]):
+    def __init__(self, data: Any, id: Union[int, List[int]] = None):
         self.data = data
         self.id = id
 
@@ -70,11 +71,11 @@ def _put_queue_item(queue: Queue, item: _ItemWrapper, terminate_flag: Event):
                 raise Terminate()
 
 class Node:
-    def __init__(self, max_size_in: int = 1, max_size_out: int = 1) -> None:
+    def __init__(self, in_buffer_size: int = 1, out_buffer_size: int = 1) -> None:
         self.input: Dict[str, Queue] = {}
         self.output: Dict[str, Queue] = {}
-        self.max_size_in = max_size_in
-        self.max_size_out = max_size_out
+        self.in_buffer_size = in_buffer_size
+        self.out_buffer_size = out_buffer_size
 
     @abstractmethod
     def start(self):
@@ -90,16 +91,16 @@ class Node:
     
     def _get_input_queue(self, key: str = None):
         if key not in self.input:
-            self.input[key] = Queue(maxsize=self.max_size_in)
+            self.input[key] = Queue(maxsize=self.in_buffer_size)
         return self.input[key]
     
     def _get_output_queue(self, key: str = None):
         if key not in self.output:
-            self.output[key] = Queue(maxsize=self.max_size_out)
+            self.output[key] = Queue(maxsize=self.out_buffer_size)
         return self.output[key]
     
     def put(self, data: Any, key: str = None, block: bool = True) -> None:
-        item = _ItemWrapper(data, None)
+        item = _ItemWrapper(data)
         self._get_input_queue(key).put(item, block=block)
     
     def get(self, key: str = None, block: bool = True) -> Any:
@@ -115,24 +116,24 @@ class Node:
         self.join()
 
 
-class JobNode(Node):
+class ConcurrentNode(Node):
     job: Union[Thread, Process]
 
-    def __init__(self, running_as: Literal['thread', 'process'] = 'thread', max_size_in: int = 1, max_size_out: int = 1) -> None:
-        super().__init__(max_size_in, max_size_out)
+    def __init__(self, running_as: Literal['thread', 'process'] = 'thread', in_buffer_size: int = 1, out_buffer_size: int = 1) -> None:
+        super().__init__(in_buffer_size, out_buffer_size)
         self.running_as = running_as
 
     @abstractmethod
-    def _job_fn(self, input: Dict[str, Queue], output: Dict[str, Queue], terminate_flag: Event):
+    def _loop_fn(self, input: Dict[str, Queue], output: Dict[str, Queue], terminate_flag: Event):
         pass
 
     def start(self):
         if self.running_as == 'thread':
             terminate_flag = threading.Event()
-            job = Thread(target=self._job_fn, args=(self.input, self.output, terminate_flag))
+            job = Thread(target=self._loop_fn, args=(self.input, self.output, terminate_flag))
         elif self.running_as == 'process':
             terminate_flag = multiprocessing.Event()
-            job = Process(target=self._job_fn, args=(self.input, self.output, terminate_flag))
+            job = Process(target=self._loop_fn, args=(self.input, self.output, terminate_flag))
         job.start()
         self.job = job
         self.terminate_flag = terminate_flag
@@ -144,9 +145,9 @@ class JobNode(Node):
         self.job.join()
 
 
-class Worker(JobNode):
-    def __init__(self, running_as: Literal['thread', 'process'] = 'thread', max_size_in: int = 0, max_size_out: int = 0) -> None:
-        super().__init__(running_as, max_size_in, max_size_out)
+class Worker(ConcurrentNode):
+    def __init__(self, running_as: Literal['thread', 'process'] = 'thread', in_buffer_size: int = 0, out_buffer_size: int = 0) -> None:
+        super().__init__(running_as, in_buffer_size, out_buffer_size)
 
     def init(self) -> None:
         """
@@ -163,35 +164,43 @@ class Worker(JobNode):
         """
         pass
 
-    def _job_fn(self, input: Dict[str, Queue], output: Dict[str, Queue], terminate_flag: Event):
+    def _loop_fn(self, input: Dict[str, Queue], output: Dict[str, Queue], terminate_flag: Event):
         self.init()
         try:
             while True:
                 args, kwargs = [], {}
-                for key, queue in input.items():
-                    item = _get_queue_item(queue, terminate_flag)
-                    if key is None:
-                        args.append(item.data)
-                    else:
+                if None in input:
+                    # Single input
+                    item = _get_queue_item(input[None], terminate_flag)
+                    args.append(item.data)
+                else:
+                    # Multiple inputs
+                    for key, queue in input.items():
+                        item = _get_queue_item(queue, terminate_flag)
                         kwargs[key] = item.data
                 
                 result = self.work(*args, **kwargs)
                 
-                for key, queue in output.items():
-                    if key is None:
-                        _put_queue_item(queue, _ItemWrapper(result, item.id), terminate_flag)
-                    else:
-                        _put_queue_item(queue, _ItemWrapper(result[key], item.id), terminate_flag)
+                if None in output:
+                    # Single output
+                    _put_queue_item(output[None], _ItemWrapper(result, item.id), terminate_flag)
+                else:
+                    # Multiple outputs
+                    for key, queue in output.items():
+                        if key is None:
+                            _put_queue_item(queue, _ItemWrapper(result, item.id), terminate_flag)
+                        else:
+                            _put_queue_item(queue, _ItemWrapper(result[key], item.id), terminate_flag)
         except Terminate:
             return
 
 
-class Provider(JobNode):
+class Provider(ConcurrentNode):
     """
     A node that provides data to successive nodes. It takes no input and provides data to the output queue.
     """
-    def __init__(self, running_as: Literal['thread', 'process'], max_size_out: int = 1) -> None:
-        super().__init__(running_as, 0, max_size_out)
+    def __init__(self, running_as: Literal['thread', 'process'], out_buffer_size: int = 1) -> None:
+        super().__init__(running_as, 0, out_buffer_size)
 
     def init(self) -> None:
         """
@@ -203,18 +212,18 @@ class Provider(JobNode):
     def provide(self) -> Generator[Any, None, None]:
         pass
 
-    def _job_fn(self, input: Dict[str, Queue], output: Dict[str, Queue], terminate_flag: Event):
+    def _loop_fn(self, input: Dict[str, Queue], output: Dict[str, Queue], terminate_flag: Event):
         self.init()
         try:
             for data in self.provide():
-                _put_queue_item(output[None], _ItemWrapper(data, None), terminate_flag)
+                _put_queue_item(output[None], _ItemWrapper(data), terminate_flag)
         except Terminate:
             return
 
 
 class WorkerFunction(Worker):
-    def __init__(self, fn: Callable, running_as: 'thread', max_size_in: int = 1, max_size_out: int = 1) -> None:
-        super().__init__(running_as, max_size_in, max_size_out)
+    def __init__(self, fn: Callable, running_as: 'thread', in_buffer_size: int = 1, out_buffer_size: int = 1) -> None:
+        super().__init__(running_as, in_buffer_size, out_buffer_size)
         self.fn = fn
 
     def work(self, *args, **kwargs):
@@ -222,8 +231,8 @@ class WorkerFunction(Worker):
 
 
 class ProviderFunction(Provider):
-    def __init__(self, fn: Callable, running_as: 'thread', max_size_out: int = 1) -> None:
-        super().__init__(running_as, max_size_out)
+    def __init__(self, fn: Callable, running_as: 'thread', out_buffer_size: int = 1) -> None:
+        super().__init__(running_as, out_buffer_size)
         self.fn = fn
 
     def provide(self):
@@ -236,21 +245,18 @@ class Link:
         self.src = src
         self.dst = dst
         
-
-    def _thread_fn(self, src: Queue, dst: Queue, terminate_flag: Event):
+    def _thread_fn(self):
         try:
             while True:
-                item = _get_queue_item(src, terminate_flag)
-                _put_queue_item(dst, item, terminate_flag)
+                item = _get_queue_item(self.src, self.terminate_flag)
+                _put_queue_item(self.dst, item, self.terminate_flag)
         except Terminate:
             return
     
     def start(self):
-        terminate_flag = threading.Event()
-        thread = Thread(target=self._thread_fn, args=(self.src, self.dst, terminate_flag))
-        thread.start()
-        self.thread = thread
-        self.terminate_flag = terminate_flag
+        self.terminate_flag = threading.Event()
+        self.thread = Thread(target=self._thread_fn)
+        self.thread.start()
 
     def terminate(self):
         self.terminate_flag.set()
@@ -263,8 +269,8 @@ class Pipeline(Node):
     """
     Pipeline of nodes connected by links.
     """
-    def __init__(self, max_size_in: int = 1, max_size_out: int = 1):
-        super().__init__(max_size_in, max_size_out)
+    def __init__(self, in_buffer_size: int = 1, out_buffer_size: int = 1):
+        super().__init__(in_buffer_size, out_buffer_size)
         self.nodes: List[Node] = []
         self.links: List[Link] = []
 
@@ -336,16 +342,16 @@ class Sequential(Pipeline):
     Pipeline of nodes in sequential order, where each node takes the output of the previous node as input.
     The order of input and output items is preserved (FIFO)
     """
-    def __init__(self, *nodes: Union[Node, Callable], function_running_as: Literal['thread', 'process'] = 'thread', max_size_in: int = 1, max_size_out: int = 1):
+    def __init__(self, nodes: List[Union[Node, Callable]], function_running_as: Literal['thread', 'process'] = 'thread', in_buffer_size: int = 1, out_buffer_size: int = 1):
         """
         Initialize the pipeline with a list of nodes to execute sequentially.
         ### Parameters:
         - nodes: List of nodes or functions to execute sequentially. Generator functions are wrapped in provider nodes, and other functions are wrapped in worker nodes.
         - function_running_as: Whether to wrap the function as a thread or process worker. Default is 'thread'.
-        - max_size_in: Maximum size of the input queue of the pipeline. Default is 0 (unlimited).
-        - max_size_out: Maximum size of the output queue of the pipeline. Default is 0 (unlimited).
+        - in_buffer_size: Maximum size of the input queue of the pipeline. Default is 0 (unlimited).
+        - out_buffer_size: Maximum size of the output queue of the pipeline. Default is 0 (unlimited).
         """
-        super().__init__(max_size_in, max_size_out)
+        super().__init__(in_buffer_size, out_buffer_size)
         for node in nodes:
             if isinstance(node, Node):
                 pass
@@ -360,25 +366,93 @@ class Sequential(Pipeline):
         self.chain([None, *self.nodes, None])
 
 
-class Parallel(Pipeline):
+class Parallel(Node):
+    """
+    A FIFO node that runs multiple nodes in parallel to process the input items. Each input item is handed to one of the nodes whoever is available.
+    NOTE: It is FIFO if and only if all the nested nodes are FIFO.
+    """
+    nodes: List[Node]
+
+    def __init__(self, nodes: Iterable[Node], in_buffer_size: int = 1, out_buffer_size: int = 1, function_running_as: Literal['thread', 'process'] = 'thread'):
+        super().__init__(in_buffer_size, out_buffer_size)
+        self.nodes = []
+        for node in nodes:
+            if isinstance(node, Node):
+                pass
+            elif isinstance(node, Callable):
+                if inspect.isgeneratorfunction(node):
+                    node = ProviderFunction(node, function_running_as)
+                else:
+                    node = WorkerFunction(node, function_running_as)
+            else:
+                raise ValueError(f"Invalid node type: {type(node)}")
+            node._get_input_queue()
+            node._get_output_queue()
+            self.nodes.append(node)
+        self.output_order = Queue()
+        self.lock = threading.Lock()
+
+    def _in_thread_fn(self, node: Node):
+        try:
+            while True:
+                with self.lock:
+                    # A better idea: first make sure its node is vacant, then get it a new item. 
+                    # Currently we will not be able to know which node is busy util there is at least one item already waiting in the queue of the node.
+                    # This could lead to suboptimal scheduling.
+                    item = _get_queue_item(self._get_input_queue(), self.terminate_flag)
+                    self.output_order.put(node._get_output_queue())
+                _put_queue_item(node._get_input_queue(), item, self.terminate_flag)
+        except Terminate:
+            return
+    
+    def _out_thread_fn(self):
+        try:
+            while True:
+                queue = _get_queue_item(self.output_order, self.terminate_flag)
+                item = _get_queue_item(queue, self.terminate_flag)
+                _put_queue_item(self._get_output_queue(), item, self.terminate_flag)
+        except Terminate:
+            return
+
+    def start(self):
+        self.terminate_flag = threading.Event()
+        self.in_threads = []
+        for node in self.nodes:
+            thread = Thread(target=self._in_thread_fn, args=(node,))
+            thread.start()
+            self.in_threads.append(thread)
+        thread = Thread(target=self._out_thread_fn)
+        thread.start()
+        self.out_thread = thread
+        for node in self.nodes:
+            node.start()
+
+    def terminate(self):
+        self.terminate_flag.set()
+        for node in self.nodes:
+            node.terminate()
+
+    def join(self):
+        for thread in self.in_threads:
+            thread.join()
+        self.out_thread.join()
+
+
+class UnorderedParallel(Pipeline):
     """
     Pipeline of nodes in parallel, where each input item is handed to one of the nodes whoever is available.
     NOTE: The order of the output items is NOT guaranteed to be the same as the input items, depending on how fast the nodes handle their input.
     """
-    def __init__(self, *nodes: Union[Node, Callable], num_duplicated_workers: int = None, function_running_as: Literal['thread', 'process'] = 'thread', max_size_in: int = 1, max_size_out: int = 1):
+    def __init__(self, nodes: List[Union[Node, Callable]], function_running_as: Literal['thread', 'process'] = 'thread', in_buffer_size: int = 1, out_buffer_size: int = 1):
         """
         Initialize the pipeline with a list of nodes to execute in parallel. If a function is given, it is wrapped in a worker node.
         ### Parameters:
         - nodes: List of nodes or functions to execute in parallel. Generator functions are wrapped in provider nodes, and other functions are wrapped in worker nodes.
-        - num_duplicated_workers: Number of duplicated workers for each node. If specified, the only one node is allowed and deepcopied for each worker.
         - function_running_as: Whether to wrap the function as a thread or process worker. Default is 'thread'.
-        - max_size_in: Maximum size of the input queue of the pipeline. Default is 0 (unlimited).
-        - max_size_out: Maximum size of the output queue of the pipeline. Default is 0 (unlimited).
+        - in_buffer_size: Maximum size of the input queue of the pipeline. Default is 0 (unlimited).
+        - out_buffer_size: Maximum size of the output queue of the pipeline. Default is 0 (unlimited).
         """
-        super().__init__(max_size_in, max_size_out)
-        if num_duplicated_workers is not None:
-            assert len(nodes) == 1, "Only one node is allowed when `num_duplicated_workers` is specified."
-            nodes = [deepcopy(nodes[0]) for _ in range(num_duplicated_workers)]
+        super().__init__(in_buffer_size, out_buffer_size)
         for node in nodes:
             if isinstance(node, Node):
                 pass
@@ -394,19 +468,19 @@ class Parallel(Pipeline):
             self.chain([None, self.nodes[i], None])
 
 
-class Batch(JobNode):
+class Batch(ConcurrentNode):
     """
     Groups every `batch_size` items into a batch (a list of items) and passes the batch to successive nodes.
     The `patience` parameter specifies the maximum time to wait for a batch to be filled before sending it to the next node,
     i.e., when the earliest item in the batch is out of `patience` seconds, the batch is sent regardless of its size.
     """
-    def __init__(self, batch_size: int, patience: float = None, max_size_in: int = 1, max_size_out: int = 1):
+    def __init__(self, batch_size: int, patience: float = None, in_buffer_size: int = 1, out_buffer_size: int = 1):
         assert batch_size > 0, "Batch size must be greater than 0."
-        super().__init__('thread', max_size_in, max_size_out)
+        super().__init__('thread', in_buffer_size, out_buffer_size)
         self.batch_size = batch_size
         self.patience = patience
 
-    def _job_fn(self, input: Dict[str, Queue], output: Dict[str, Queue], terminate_flag: Event):
+    def _loop_fn(self, input: Dict[str, Queue], output: Dict[str, Queue], terminate_flag: Event):
         try:
             while True:
                 batch_id, batch_data = [], []
@@ -434,14 +508,14 @@ class Batch(JobNode):
             return
 
 
-class Unbatch(JobNode):
+class Unbatch(ConcurrentNode):
     """
     Ungroups every batch (a list of items) into individual items and passes them to successive nodes.
     """
-    def __init__(self, max_size_in: int = 1, max_size_out: int = 1):
-        super().__init__('thread', max_size_in, max_size_out)
+    def __init__(self, in_buffer_size: int = 1, out_buffer_size: int = 1):
+        super().__init__('thread', in_buffer_size, out_buffer_size)
 
-    def _job_fn(self, input: Dict[str, Queue], output: Dict[str, Queue], terminate_flag: Event):
+    def _loop_fn(self, input: Dict[str, Queue], output: Dict[str, Queue], terminate_flag: Event):
         try:
             while True:
                 batch = _get_queue_item(input[None], terminate_flag)
@@ -450,3 +524,11 @@ class Unbatch(JobNode):
                     _put_queue_item(output[None], item, terminate_flag)
         except Terminate:
             return
+
+
+class Buffer(Node):
+    "A FIFO node that buffers items in a queue. Usefull achieve better temporal balance."
+    def __init__(self, size: int):
+        super().__init__(size, size)
+        self.size = size
+        self.input[None] = self.output[None] = Queue(maxsize=size)
