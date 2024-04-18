@@ -22,11 +22,12 @@ __all__ = [
     'WorkerFunction',
     'Provider',
     'ProviderFunction',
-    'Pipeline', 
     'Sequential',
-    'Parallel',
     'Batch',
     'Unbatch',
+    'Parallel',
+    'Pipeline', 
+    'Buffer',
 ]
 
 TERMINATE_CHECK_INTERVAL = 0.5
@@ -84,6 +85,10 @@ class Node:
     @abstractmethod
     def terminate(self):
         pass
+
+    def stop(self):
+        self.terminate()
+        self.join()
 
     @abstractmethod
     def join(self):
@@ -527,7 +532,7 @@ class Unbatch(ConcurrentNode):
 
 
 class Buffer(Node):
-    "A FIFO node that buffers items in a queue. Usefull achieve better temporal balance."
+    "A FIFO node that buffers items in a queue. Usefull achieve better temporal balance when its successor node has a variable processing time."
     def __init__(self, size: int):
         super().__init__(size, size)
         self.size = size
